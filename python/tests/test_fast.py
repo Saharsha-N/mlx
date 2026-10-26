@@ -566,6 +566,57 @@ class TestFast(mlx_tests.MLXTestCase):
                 self.assertEqual(out.shape, targets.shape)
                 self.assertLess(mx.abs(out - expected).max().item(), tolerances[dtype])
 
+    def test_cross_entropy_large_margin(self):
+        # Past a ~ 16, 1 + 2e^-a rounds to 1 in float32. The loss and the
+        # target gradient must stay log1p(2e^-a) and -2e^-a / (1 + 2e^-a).
+        def f(x, y):
+            return mx.fast.cross_entropy(x, y).sum()
+
+        y = mx.array([0])
+        for a in [18.0, 40.0]:
+            s = 2 * math.exp(-a)
+            for dtype in [mx.float32, mx.bfloat16]:
+                x = mx.array([[a, 0.0, 0.0]], dtype)
+                loss, grad = mx.value_and_grad(f)(x, y)
+                grad = grad.astype(mx.float32)
+                self.assertAlmostEqual(loss.item() / math.log1p(s), 1.0, delta=1e-3)
+                self.assertAlmostEqual(
+                    grad[0, 0].item() * (1 + s) / -s, 1.0, delta=1e-2
+                )
+                self.assertLess(abs(grad.sum().item()), 1e-3 * s)
+
+        # Large vocabulary: each other term is too small to change 1 alone,
+        # but their sum is not.
+        V = 131072
+        x = mx.zeros((1, V)).at[0, 0].add(18.0)
+        s = (V - 1) * math.exp(-18.0)
+        loss = mx.fast.cross_entropy(x, y)
+        self.assertAlmostEqual(loss.item() / math.log1p(s), 1.0, delta=1e-3)
+
+    def test_cross_entropy_edge_rows(self):
+        def value_and_grad(x, y):
+            return mx.value_and_grad(lambda x: mx.fast.cross_entropy(x, y).sum())(x)
+
+        # Masked classes: the other logits that are -inf get no gradient
+        inf = float("inf")
+        loss, grad = value_and_grad(mx.array([[2.0, -inf, -inf, 1.0]]), mx.array([0]))
+        p = math.exp(-1.0) / (1 + math.exp(-1.0))
+        self.assertAlmostEqual(loss.item(), math.log1p(math.exp(-1.0)), places=6)
+        self.assertTrue(mx.allclose(grad, mx.array([[-p, 0.0, 0.0, p]]), atol=1e-6))
+
+        # No other class: the loss and the gradient are 0, not NaN
+        for x in [mx.array([[3.0]]), mx.array([[2.0, -inf, -inf]])]:
+            loss, grad = value_and_grad(x, mx.array([0]))
+            self.assertEqual(loss.item(), 0.0)
+            self.assertTrue(mx.array_equal(grad, mx.zeros_like(x)))
+
+        # Negative class indices count from the end
+        x = mx.array([[1.0, 2.0, 3.0]])
+        loss_neg, grad_neg = value_and_grad(x, mx.array([-1]))
+        loss_pos, grad_pos = value_and_grad(x, mx.array([2]))
+        self.assertAlmostEqual(loss_neg.item(), loss_pos.item(), places=6)
+        self.assertTrue(mx.allclose(grad_neg, grad_pos))
+
     def test_cross_entropy_shape_checks(self):
         logits = mx.random.normal(shape=(4, 16))
         with self.assertRaises(ValueError):

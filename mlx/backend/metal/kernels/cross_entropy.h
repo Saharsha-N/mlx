@@ -1,5 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
+#include "mlx/backend/metal/kernels/expm1f.h"
+
 template <
     typename T,
     typename AccT = float,
@@ -42,6 +44,10 @@ template <
             (offset + i < axis_size) ? AccT(in[offset + i]) : Limits<AccT>::min;
       }
     }
+    // Leave out the target so that its e^0 = 1 does not absorb small terms.
+    for (int i = 0; i < N_READS; i++) {
+      vals[i] = (offset + i == y_n) ? Limits<AccT>::min : vals[i];
+    }
     prevmax = maxval;
     for (int i = 0; i < N_READS; i++) {
       maxval = (maxval < vals[i]) ? vals[i] : maxval;
@@ -76,10 +82,11 @@ template <
   normalizer = simd_sum(normalizer);
 
   if (lid == 0) {
-    // Subtract the two logits first; they are the same magnitude, so less is
-    // lost than in logsumexp - x_t.
+    // a is the logsumexp of the other logits minus the target logit, and the
+    // loss is softplus(a).
     AccT gap = maxval - x_t;
-    out[gid] = isinf(maxval) ? float(gap) : float(log(normalizer) + gap);
+    AccT a = isinf(maxval) ? gap : log(normalizer) + gap;
+    out[gid] = float(a > 0 ? a + log1p(fast::exp(-a)) : log1p(fast::exp(a)));
   }
 }
 
@@ -106,6 +113,8 @@ template <
   AccT x_t = AccT(in[y_n]);
   AccT g = AccT(cotan[gid]);
   AccT l = AccT(loss[gid]);
+  // p_t - 1 = e^-l - 1, without the cancellation.
+  AccT d_t = expm1f(-l);
 
   // out aliases in when the input is donated, so every thread must read the
   // target column before any thread writes.
@@ -118,14 +127,14 @@ template <
       for (int i = 0; i < N_READS; i++) {
         int col = offset + i;
         AccT p = fast::exp((AccT(in[col]) - x_t) - l);
-        out[col] = T(g * (p - ((col == y_n) ? AccT(1) : AccT(0))));
+        out[col] = T(g * ((col == y_n) ? d_t : p));
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
         int col = offset + i;
         if (col < axis_size) {
           AccT p = fast::exp((AccT(in[col]) - x_t) - l);
-          out[col] = T(g * (p - ((col == y_n) ? AccT(1) : AccT(0))));
+          out[col] = T(g * ((col == y_n) ? d_t : p));
         }
       }
     }

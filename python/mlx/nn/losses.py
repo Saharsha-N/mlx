@@ -20,6 +20,19 @@ def _reduce(loss: mx.array, reduction: Reduction = "none"):
         return loss
 
 
+def _log_softmax(x: mx.array, axis: int) -> mx.array:
+    # Leave the max out of the logsumexp so that its e^0 = 1 does not absorb
+    # the other terms when the max is much larger than them.
+    idx = mx.stop_gradient(mx.expand_dims(mx.argmax(x, axis=axis), axis))
+    shape = [1] * x.ndim
+    shape[axis] = x.shape[axis]
+    is_max = mx.arange(x.shape[axis]).reshape(shape) == idx
+    shifted = mx.where(is_max, 0.0, x - mx.take_along_axis(x, idx, axis))
+    others = mx.where(is_max, mx.finfo(x.dtype).min, shifted)
+    lse = mx.logsumexp(others, axis=axis, keepdims=True)
+    return shifted - mx.logaddexp(lse, 0.0)
+
+
 def cross_entropy(
     logits: mx.array,
     targets: mx.array,
@@ -64,17 +77,12 @@ def cross_entropy(
         >>> nn.losses.cross_entropy(logits, targets)
         array([0.348587, 0.348587], dtype=float32)
         >>>
-        >>> # Half precision logits with class indices as targets. On the GPU a
-        >>> # fused kernel accumulates the reduction in float32:
+        >>> # Half precision logits with class indices as targets. The reduction
+        >>> # accumulates in float32:
         >>> logits = mx.array([[2.0, -1.0], [-1.0, 2.0]], mx.bfloat16)
         >>> targets = mx.array([0, 1])
         >>> nn.losses.cross_entropy(logits, targets)
         array([0.048584, 0.048584], dtype=bfloat16)
-        >>>
-        >>> # The CPU reduces in the dtype of the logits, so upcast them to get
-        >>> # the same accuracy:
-        >>> nn.losses.cross_entropy(logits.astype(mx.float32), targets)
-        array([0.0485873, 0.0485873], dtype=float32)
     """
     if label_smoothing < 0 or label_smoothing >= 1:
         raise ValueError(f"Label smoothing must be in [0, 1), got {label_smoothing}.")
@@ -96,36 +104,34 @@ def cross_entropy(
         )
 
     use_fast = (
-        mx.default_device() == mx.gpu
-        and not targets_as_probs
-        and label_smoothing == 0
+        not targets_as_probs
         and axis in (-1, logits.ndim - 1)
         and mx.issubdtype(logits.dtype, mx.floating)
         and mx.issubdtype(targets.dtype, mx.integer)
     )
 
     if use_fast:
-        loss = mx.fast.cross_entropy(logits, targets).astype(logits.dtype)
+        loss = mx.fast.cross_entropy(logits, targets)
+        if label_smoothing > 0:
+            x = logits.astype(mx.float32)
+            score = mx.take_along_axis(x, mx.expand_dims(targets, -1), -1).squeeze(-1)
+            loss = loss + label_smoothing * (score - x.mean(axis=-1))
+        loss = loss.astype(logits.dtype)
     else:
-        logits = logits - mx.stop_gradient(mx.max(logits, axis=axis, keepdims=True))
+        log_probs = _log_softmax(logits, axis)
 
         if targets_as_probs:
-            score = mx.sum(logits * targets, axis=axis)
+            score = mx.sum(log_probs * targets, axis=axis)
         else:
             score = mx.take_along_axis(
-                logits, mx.expand_dims(targets, axis), axis
+                log_probs, mx.expand_dims(targets, axis), axis
             ).squeeze(axis)
 
-        logsumexp_logits = mx.logsumexp(logits, axis=axis)
         if label_smoothing > 0:
-            adjusted_score = (1 - label_smoothing) * score
-
-            mean_logits = logits.mean(axis=axis)
-            smoothed_loss = -mean_logits * label_smoothing
-
-            loss = logsumexp_logits - adjusted_score + smoothed_loss
+            loss = -(1 - label_smoothing) * score
+            loss = loss - label_smoothing * log_probs.mean(axis=axis)
         else:
-            loss = logsumexp_logits - score
+            loss = -score
 
     # Apply weights if provided
     if weights is not None:

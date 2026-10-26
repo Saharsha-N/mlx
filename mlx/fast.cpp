@@ -220,12 +220,25 @@ array cross_entropy(
 
   auto s = to_stream(s_);
   auto fallback = [s](const std::vector<array>& inputs) {
-    auto& x = inputs[0];
-    auto& y = inputs[1];
-    auto score =
-        squeeze(take_along_axis(x, expand_dims(y, -1, s), -1, s), -1, s);
-    auto loss = subtract(logsumexp(x, -1, /* keepdims= */ false, s), score, s);
-    return std::vector<array>{astype(loss, float32, s)};
+    auto x = astype(inputs[0], float32, s);
+    int n = x.shape(-1);
+    auto y = expand_dims(inputs[1], -1, s);
+    y = where(
+        less(y, array(0, y.dtype()), s), add(y, array(n, y.dtype()), s), y, s);
+    // Leave the target out of the logsumexp, then loss = softplus(a). This
+    // keeps small losses that 1 + e^-m would round to 0. A finite fill keeps
+    // rows without other classes (all -inf, or one class) free of NaN.
+    auto is_target = equal(y, arange(n, y.dtype(), s), s);
+    auto others = where(
+        is_target, array(std::numeric_limits<float>::lowest(), float32), x, s);
+    auto m = stop_gradient(max(others, -1, /* keepdims= */ true, s), s);
+    m = where(isinf(m, s), array(0.0f, float32), m, s);
+    auto a =
+        add(logsumexp(subtract(others, m, s), -1, /* keepdims= */ true, s),
+            subtract(m, take_along_axis(x, y, -1, s), s),
+            s);
+    return std::vector<array>{
+        logaddexp(squeeze(a, -1, s), array(0.0f, float32), s)};
   };
 
   auto passed_targets = astype(targets, int32, s);
@@ -259,25 +272,27 @@ std::vector<array> CrossEntropy::vjp(
   auto s = stream();
   auto fallback = [s](const std::vector<array>& inputs) {
     auto& x = inputs[0];
-    auto& y = inputs[1];
     auto& loss = inputs[2];
     auto& g = inputs[3];
+    auto y = where(
+        less(inputs[1], array(0, inputs[1].dtype()), s),
+        add(inputs[1], array(x.shape(-1), inputs[1].dtype()), s),
+        inputs[1],
+        s);
 
-    auto score =
-        squeeze(take_along_axis(x, expand_dims(y, -1, s), -1, s), -1, s);
-    auto lse = add(loss, astype(score, float32, s), s);
-    auto p =
-        exp(subtract(astype(x, float32, s), expand_dims(lse, -1, s), s), s);
+    auto xf = astype(x, float32, s);
+    auto score = take_along_axis(xf, expand_dims(y, -1, s), -1, s);
+    auto l = expand_dims(loss, -1, s);
+    auto p = exp(subtract(subtract(xf, score, s), l, s), s);
     Shape class_shape(x.ndim(), 1);
     class_shape.back() = x.shape(-1);
-    auto onehot = astype(
-        equal(
-            expand_dims(y, -1, s),
-            reshape(arange(x.shape(-1), y.dtype(), s), class_shape, s),
-            s),
-        float32,
+    auto is_target = equal(
+        expand_dims(y, -1, s),
+        reshape(arange(x.shape(-1), y.dtype(), s), class_shape, s),
         s);
-    auto gx = multiply(expand_dims(g, -1, s), subtract(p, onehot, s), s);
+    // p_t - 1 = e^-l - 1, without the cancellation.
+    auto d = where(is_target, expm1(negative(l, s), s), p, s);
+    auto gx = multiply(expand_dims(g, -1, s), d, s);
     return std::vector<array>{astype(gx, x.dtype(), s)};
   };
 

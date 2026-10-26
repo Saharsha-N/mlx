@@ -1,5 +1,6 @@
 # Copyright © 2023 Apple Inc.
 
+import math
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -90,6 +91,35 @@ class TestLosses(mlx_tests.MLXTestCase):
             axis=-1,
         )
         self.assertTrue(mx.allclose(loss, expected))
+
+    def test_cross_entropy_large_margin(self):
+        # For logits [a, 0, 0] and target 0 the loss is log(1 + 2e^-a). Past
+        # a ~ 16 in float32, 1 + 2e^-a rounds to 1, but the loss and the
+        # target gradient must not become 0 and the gradients must sum to 0.
+        a = 18.0
+        s = 2 * math.exp(-a)
+        expected_loss = math.log1p(s)
+        expected_grad = [-s / (1 + s), math.exp(-a) / (1 + s), math.exp(-a) / (1 + s)]
+
+        logits = mx.array([[a, 0.0, 0.0]])
+        for targets in [mx.array([0]), mx.array([[1.0, 0.0, 0.0]])]:
+
+            def loss_fn(x):
+                return nn.losses.cross_entropy(x, targets).sum()
+
+            loss, grad = mx.value_and_grad(loss_fn)(logits)
+            self.assertAlmostEqual(loss.item(), expected_loss, delta=1e-12)
+            self.assertTrue(
+                np.allclose(np.array(grad[0]), expected_grad, rtol=1e-4, atol=0)
+            )
+            self.assertEqual(grad.sum().item(), 0.0)
+
+        # With label smoothing the gradients must still sum to 0
+        def smoothed_loss_fn(x):
+            return nn.losses.cross_entropy(x, mx.array([0]), label_smoothing=0.1).sum()
+
+        grad = mx.grad(smoothed_loss_fn)(mx.array([[40.0, 0.0, 0.0, 0.0]]))
+        self.assertLess(abs(grad.sum().item()), 1e-7)
 
     def test_binary_cross_entropy(self):
         def _test_logits_as_inputs():
